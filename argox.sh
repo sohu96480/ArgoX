@@ -6022,7 +6022,8 @@ change_config() {
       [[ "$HY2_DOWN" =~ ^[1-9][0-9]*$ ]] && break
       warning " $(text 123) "
     done
-    sed -i -E "s/(up: \")([0-9]+)( Mbps\")/\1${HY2_UP}\3/g; s/(down: \")([0-9]+)( Mbps\")/\1${HY2_DOWN}\3/g" ${WORK_DIR}/subscribe/proxies
+    HY2_UP_NOW="$HY2_UP"; HY2_DOWN_NOW="$HY2_DOWN"
+    [ -s ${WORK_DIR}/subscribe/proxies ] && sed -i -E "s/(up: \")([0-9]+)( Mbps\")/\1${HY2_UP}\3/g; s/(down: \")([0-9]+)( Mbps\")/\1${HY2_DOWN}\3/g" ${WORK_DIR}/subscribe/proxies
     export_list
     return
   elif [ "$KEY" = "hopping" ]; then
