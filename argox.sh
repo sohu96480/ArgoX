@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='2.1.4 (2026.08.11)'
+VERSION='2.1.6 (2026.09.18)'
 
 # Github 反代加速代理
 GITHUB_PROXY=('https://hub.glowp.xyz/' 'https://proxy.vvvv.ee/')
@@ -28,7 +28,7 @@ START_PORT_DEFAULT='30000'  # WS/XHTTP 内部端口起始值，各协议在此�
 NGINX_PORT_DEFAULT='8080'   # Nginx 默认端口，可交互修改
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.2020111.xyz" "xn--b6gac.eu.org" "cf.090227.xyz")
 SUBSCRIBE_TEMPLATE="https://raw.githubusercontent.com/fscarmen/client_template/main"
-DEFAULT_XRAY_VERSION='26.7.28'
+DEFAULT_XRAY_VERSION='26.9.9'
 IS_SUB=${IS_SUB:-'no_sub'}  # IS_SUB:  根据菜单选项设置 (is_sub / no_sub)
 IS_ARGO=${IS_ARGO:-'no_argo'}  # IS_ARGO: 根据是否安装 WS/XHTTP 协议自动推导 (is_argo / no_argo)
 
@@ -45,8 +45,8 @@ mkdir -p "$TEMP_DIR"
 
 E[0]="Language:\n 1. English (default) \n 2. 简体中文"
 C[0]="${E[0]}"
-E[1]="1. Pre-register a fresh WARP account during install with shared-key fallback; 2. [argox -d] Change WARP account with register / manual input; 3. Make Hysteria2 Realm and port hopping mutually exclusive with confirm prompts in install and [argox -d]"
-C[1]="1. 安装期后台预注册 WARP 账户，失败回退共享密钥; 2. [argox -d] 菜单新增「更换 WARP 账户」，支持重新注册 / 手动输入; 3. Hysteria2 Realm 与端口跳跃互斥，安装与 [argox -d] 均先提示确认再切换"
+E[1]="Migrate WARP chained outbounds from proxySettings to streamSettings.sockopt.dialerProxy for Xray >= 26.9"
+C[1]="兼容 Xray 26.9+：WARP 链式出站由 proxySettings 迁移到 streamSettings.sockopt.dialerProxy"
 E[2]="No network interfaces found."
 C[2]="未找到网络接口"
 E[3]="Input errors up to 5 times.The script is aborted."
@@ -397,8 +397,8 @@ E[175]="Enter WARP reserved values (format: 123,456,789):"
 C[175]="请输入 WARP reserved 保留值（格式: 123,456,789）:"
 E[176]="Invalid reserved format. Please enter 3 numbers like 123,456,789"
 C[176]="reserved 格式错误，请输入 3 个数字，如 123,456,789"
-E[177]="Checking configuration..."
-C[177]="正在校验配置..."
+E[177]=""
+C[177]=""
 E[178]="Change WARP endpoint"
 C[178]="更换 warp endpoint"
 E[179]="Invalid private key format. Please enter a 43-character base64 key ending with \"=\"."
@@ -478,11 +478,21 @@ find_free_port() {
 }
 
 # 检测是否启用 Github CDN
+# 优化策略：
+#   1. 持久化缓存：选中的 GH_PROXY 写入 $CUSTOM_FILE（cdn_proxy=...），后续直接复用，跳过全部探测
+#   2. 直连只测 releases 域：raw.githubusercontent.com 全球可达率极高，releases 域才是真正的黑洞点
+#   3. 代理探测用 wait -n 等首个成功者，不轮询
 check_cdn() {
-  local PROXY CODE PID CMD
-  local _WAIT_COUNT=120
-  local PIDS=()
-  local RAW_URL='https://raw.githubusercontent.com/fscarmen/argox/main/argox.sh'
+  local PROXY CODE CMD _cached_proxy
+
+  # 1. 读缓存：$CUSTOM_FILE 可能不存在（首次安装），容错处理
+  if [ -s "$CUSTOM_FILE" ]; then
+    _cached_proxy=$(grep -v '^//' "$CUSTOM_FILE" 2>/dev/null | sed -n 's/^cdn_proxy=//p' | head -1)
+    [ -n "$_cached_proxy" ] && { GH_PROXY="$_cached_proxy"; return; }
+  fi
+
+  # 探测点：github releases 域（cloudflared / jq / Xray.zip 等二进制真实下载路径）
+  local REL_URL='https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64'
 
   # 确定下载工具：优先 wget，次选 curl
   if command -v wget >/dev/null 2>&1; then
@@ -504,33 +514,36 @@ check_cdn() {
     fi
   }
 
-  # 直连检测
-  CODE=$(get_code "$RAW_URL")
+  # 2. 直连检测：只测 releases 域（raw 域全球可达率极高，releases 域才是 IPv6-only 黑洞点）
+  CODE=$(get_code "$REL_URL")
   if [ "$CODE" = '200' ]; then
     GH_PROXY=''
+    # 直连可达也写缓存，避免后续重复探测
+    [ -d "$WORK_DIR" ] && write_custom 'cdn_proxy' ''
     return
   fi
 
-  # 并发探测代理
+  # 3. 直连失败 → 并发探测代理镜像，用 wait -n 等首个成功者
   for PROXY in "${GITHUB_PROXY[@]}"; do
     {
-      CODE=$(get_code "${PROXY}${RAW_URL}")
+      CODE=$(get_code "${PROXY}${REL_URL}")
       [ "$CODE" = '200' ] && [ ! -e "${TEMP_DIR}/cdn_proxy" ] && printf '%s' "$PROXY" > "${TEMP_DIR}/cdn_proxy"
     } &
-    PIDS+=("$!")
   done
 
-  # 等待探测结果或超时
-  while [ ! -e "${TEMP_DIR}/cdn_proxy" ] && [ "$_WAIT_COUNT" -gt 0 ]; do
-    sleep 0.05
-    (( _WAIT_COUNT-- )) || true
-  done
+  # wait -n 等最快完成的子任务（Bash 4.3+），老版本兜底 sleep 1
+  wait -n 2>/dev/null || sleep 1
 
-  [ -e "${TEMP_DIR}/cdn_proxy" ] && GH_PROXY=$(cat "${TEMP_DIR}/cdn_proxy") || GH_PROXY=''
+  if [ -e "${TEMP_DIR}/cdn_proxy" ]; then
+    GH_PROXY=$(cat "${TEMP_DIR}/cdn_proxy")
+    # 写缓存：后续运行直接复用，跳过全部探测
+    [ -d "$WORK_DIR" ] && write_custom 'cdn_proxy' "$GH_PROXY"
+  else
+    GH_PROXY=''
+  fi
 
   # 清理后台任务和临时文件
-  for PID in "${PIDS[@]}"; do kill "$PID" >/dev/null 2>&1 || true; done
-  for PID in "${PIDS[@]}"; do wait "$PID" 2>/dev/null || true; done
+  kill $(jobs -p) 2>/dev/null; wait $(jobs -p) 2>/dev/null
   rm -f "${TEMP_DIR}/cdn_proxy"
 }
 
@@ -809,7 +822,7 @@ start_pre() {
     chmod 755 ${WORK_DIR}
     rm -f "\$pidfile"
     if [ -s ${WORK_DIR}/nginx.conf ] && command -v /usr/sbin/nginx >/dev/null 2>&1; then
-        pgrep -f "nginx.*${WORK_DIR}/nginx.conf" >/dev/null 2>&1 || /usr/sbin/nginx -c ${WORK_DIR}/nginx.conf
+        ps -eo pid,args | grep -q "[n]ginx.*${WORK_DIR}/nginx.conf" || /usr/sbin/nginx -c ${WORK_DIR}/nginx.conf
     fi
     return 0
 }
@@ -820,7 +833,7 @@ stop() {
     local RETVAL=\$?
     if [ \$RETVAL -ne 0 ]; then
         local XRAY_PIDS
-        XRAY_PIDS="\$(ps -eo pid,args | awk -v work_dir="$WORK_DIR" '\$0~(work_dir"/xray run"){print \$1;exit}')"
+        XRAY_PIDS="\$(ps -eo pid,args | grep "[x]ray run -c ${WORK_DIR}/inbound.json" | awk '{print \$1}')"
         if [ -n "\$XRAY_PIDS" ]; then
             for pid in \$XRAY_PIDS; do
                 kill -9 "\$pid" 2>/dev/null
@@ -829,7 +842,7 @@ stop() {
     fi
     if [ -s ${WORK_DIR}/nginx.conf ] && command -v /usr/sbin/nginx >/dev/null 2>&1; then
         local NGINX_MASTER
-        NGINX_MASTER="\$(ps -eo pid,args | awk -v d='${WORK_DIR}' '\$0~(d\"/nginx.conf\") && /nginx: master process/{print \$1;exit}')"
+        NGINX_MASTER="\$(ps -eo pid,args | grep "[n]ginx: master process.*${WORK_DIR}/nginx.conf" | awk '{print \$1}')"
         if [ -n "\$NGINX_MASTER" ]; then
             kill -QUIT \$NGINX_MASTER 2>/dev/null
             sleep 1
@@ -1248,8 +1261,12 @@ check_install() {
 
   # 任务 4: 注册 warp 账号
   {
-    wget -qO- --tries=10 --waitretry=1 --timeout=2 "https://warp.cloudflare.nyc.mn/?run=register" > $TEMP_DIR/warp_account.json 2>/dev/null
+    timeout 15 bash <(wget -qO- --timeout=5 --tries=1 "https://gitlab.com/fscarmen/warp/-/raw/main/api.sh") --register > $TEMP_DIR/warp_account.json 2>/dev/null
   } &
+
+  # 已安装且 Xray 开启时，预取流量统计缓存（STATS_JSON），
+  # 菜单 / -n / -r 均经 check_install，可复用该缓存，避免重复查询
+  ensure_stats_data 2>/dev/null
 }
 
 # 为了适配 alpine，定义 cmd_systemctl 的函数
@@ -1328,17 +1345,26 @@ check_system_info() {
     ARGO_DAEMON_FILE='/etc/init.d/argo'; XRAY_DAEMON_FILE='/etc/init.d/xray'; DAEMON_RUN_PATTERN="command_args="
   fi
 
-  if command -v systemd-detect-virt >/dev/null 2>&1; then
+  # 判断虚拟化
+  if [ "$SYSTEM" = 'Alpine' ]; then
+    command -v virt-what >/dev/null 2>&1 || ${PACKAGE_INSTALL[int]} virt-what >/dev/null 2>&1
+    command -v virt-what >/dev/null 2>&1 && VIRT=$(virt-what | sed -n 1p) || VIRT=unknown
+  elif command -v systemd-detect-virt >/dev/null 2>&1; then
     VIRT=$(systemd-detect-virt)
+  elif command -v hostnamectl >/dev/null 2>&1; then
+    VIRT=$(hostnamectl | awk '/Virtualization/{print $NF}')
   elif grep -qa container= /proc/1/environ 2>/dev/null; then
     VIRT=$(tr '\0' '\n' </proc/1/environ | awk -F= '/container=/{print $2; exit}')
   elif grep -Eq '(lxc|docker|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
     VIRT=$(grep -Eo '(lxc|docker|kubepods|containerd)' /proc/1/cgroup | sed -n 1p)
-  elif command -v hostnamectl >/dev/null 2>&1; then
-    VIRT=$(hostnamectl | awk '/Virtualization/{print $NF}')
   else
-    command -v virt-what >/dev/null 2>&1 && ${PACKAGE_INSTALL[int]} virt-what >/dev/null 2>&1
-    command -v virt-what >/dev/null 2>&1 && VIRT=$(virt-what | sed -n 1p) || VIRT=unknown
+    VIRT=unknown
+  fi
+
+  if [ -c /dev/net/tun ] || cat /dev/net/tun 2>&1 | grep -q "in bad state\|处于错误状态"; then
+    IS_TUN='is_tun'
+  else
+    IS_TUN='no_tun'
   fi
 }
 
@@ -1391,12 +1417,18 @@ check_system_ip() {
     elif grep -qi 'cloudflare' <<< "$ASNORG4" && [ -n "$WAN6" ] && ! grep -qi 'cloudflare' <<< "$ASNORG6"; then
       SERVER_IP_DEFAULT=$WAN6
     elif [ -s "$CUSTOM_FILE" ]; then
+      # 已有部署：校验/确认已保存的 serverIp（交互输入后写回 custom，供 fetch_nodes_value 读取）
       local a=6
       until [ -n "$SERVER_IP" ] && is_valid_server_addr "$SERVER_IP"; do
         ((a--)) || true
         [ "$a" = 0 ] && error "\n $(text 3) \n"
         reading "\n $(text 54) " SERVER_IP
       done
+      write_custom 'serverIp' "${SERVER_IP}"
+    else
+      # WAN4/WAN6 均为 Cloudflare（warp/warp-go 全隧穿）或未探测到时：
+      # 用任一非空出口 IP 作为默认，避免 SERVER_IP_DEFAULT 为空导致节点 server 缺失
+      SERVER_IP_DEFAULT=${WAN4:-$WAN6}
     fi
   elif [ -n "$WAN4" ]; then
     SERVER_IP_DEFAULT=$WAN4
@@ -1450,23 +1482,64 @@ calc_install_steps() {
   TOTAL_STEPS=$_total
 }
 
-# 生成 Reality 密钥对
-generate_reality_keypair() {
-  local KEYPAIR
-  local _XRAY_BIN="$TEMP_DIR/xray"
-  [ ! -x "$_XRAY_BIN" ] && _XRAY_BIN="$WORK_DIR/xray"
+# 从私钥推导 Reality 公钥：依次尝试 xray 二进制（TEMP_DIR → WORK_DIR）、openssl 本地、远程 API；
+# 成功输出公钥，全部失败输出空串。不依赖某个特定工具，任何环境都可用。
+derive_reality_public() {
+  local _priv="$1" _pub='' _bin
+  # 方法1：xray 二进制（优先 TEMP_DIR，兜底 WORK_DIR）
+  for _bin in "$TEMP_DIR/xray" "$WORK_DIR/xray"; do
+    [ -x "$_bin" ] || continue
+    _pub=$($_bin x25519 -i "$_priv" 2>/dev/null | awk '/Public/{print $NF}')
+    [ -n "$_pub" ] && { echo "$_pub"; return 0; }
+  done
+  # 方法2：openssl 本地推导（依赖 xxd）
+  if command -v xxd >/dev/null 2>&1; then
+    local B64 MOD PREFIX_HEX PRIV_HEX PRIV_LEN
+    B64=$(printf '%s' "$_priv" | tr '_-' '/+')
+    MOD=$(( ${#B64} % 4 ))
+    if [ "$MOD" -eq 2 ]; then
+      B64="${B64}=="
+    elif [ "$MOD" -eq 3 ]; then
+      B64="${B64}="
+    elif [ "$MOD" -ne 0 ]; then
+      B64=''
+    fi
+    if [ -n "$B64" ] && echo "$B64" | base64 -d > "$TEMP_DIR/_X25519_PRIV_RAW" 2>/dev/null; then
+      PRIV_LEN=$(stat -c%s "$TEMP_DIR/_X25519_PRIV_RAW" 2>/dev/null || stat -f%z "$TEMP_DIR/_X25519_PRIV_RAW")
+      if [ "$PRIV_LEN" -eq 32 ]; then
+        PREFIX_HEX="302e020100300506032b656e04220420"
+        PRIV_HEX=$(xxd -p -c 256 "$TEMP_DIR/_X25519_PRIV_RAW" | tr -d '\n')
+        printf "%s%s" "$PREFIX_HEX" "$PRIV_HEX" | xxd -r -p > "$TEMP_DIR/_X25519_PRIV_DER"
+        if openssl pkcs8 -inform DER -in "$TEMP_DIR/_X25519_PRIV_DER" -nocrypt -out "$TEMP_DIR/_X25519_PRIV_PEM" 2>/dev/null && \
+           openssl pkey -in "$TEMP_DIR/_X25519_PRIV_PEM" -pubout -outform DER > "$TEMP_DIR/_X25519_PUB_DER" 2>/dev/null; then
+          tail -c 32 "$TEMP_DIR/_X25519_PUB_DER" > "$TEMP_DIR/_X25519_PUB_RAW"
+          _pub=$(base64 -w0 "$TEMP_DIR/_X25519_PUB_RAW" | tr '+/' '-_' | sed -E 's/=+$//')
+          [ -n "$_pub" ] && { echo "$_pub"; return 0; }
+        fi
+      fi
+    fi
+  fi
+  # 方法3：远程 API
+  echo "$(wget --no-check-certificate -qO- --tries=3 --timeout=2 \
+    "https://realitykey.cloudflare.now.cc/?privateKey=$_priv" \
+    | awk -F '"' '/publicKey/{print $4}')"
+}
 
-  # 如果 xray 二进制文件尚不可用（如非交互式安装且下载未完成），则回退到 openssl 生成
-  if [ -x "$_XRAY_BIN" ]; then
-    KEYPAIR=$($_XRAY_BIN x25519)
+# 生成 Reality 密钥对：xray 二进制（TEMP_DIR → WORK_DIR）优先，不可用时 openssl 生成私钥并尽力推导公钥
+generate_reality_keypair() {
+  local KEYPAIR _bin
+  for _bin in "$TEMP_DIR/xray" "$WORK_DIR/xray"; do
+    [ -x "$_bin" ] || continue
+    KEYPAIR=$($_bin x25519 2>/dev/null)
     REALITY_PRIVATE=$(awk '/Private/{print $NF}' <<< "$KEYPAIR")
     REALITY_PUBLIC=$(awk '/Public/{print $NF}' <<< "$KEYPAIR")
-  else
-    # 回退逻辑：使用 openssl 生成私钥并派生公钥
-    ! command -v openssl >/dev/null 2>&1 && return
-    REALITY_PRIVATE=$(openssl genpkey -algorithm x25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '/+' '_-' | tr -d '=')
-    REALITY_PUBLIC=''
-  fi
+    [ -n "$REALITY_PRIVATE" ] && return 0
+  done
+  # xray 不可用（如非交互式安装且下载未完成）→ openssl 生成私钥，并尝试推导公钥
+  ! command -v openssl >/dev/null 2>&1 && return 1
+  REALITY_PRIVATE=$(openssl genpkey -algorithm x25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '/+' '_-' | tr -d '=')
+  [ -z "$REALITY_PRIVATE" ] && return 1
+  REALITY_PUBLIC=$(derive_reality_public "$REALITY_PRIVATE")
 }
 
 # 输入节点名称（与全新安装一致；已有节点名称则沿用）
@@ -1685,41 +1758,8 @@ xray_variable() {
       if [ -z "$REALITY_PRIVATE" ]; then
         generate_reality_keypair
       else
-        # 从私钥生成公钥：优先使用 OpenSSL 本地生成，回退使用远程 API
-        if command -v xxd >/dev/null 2>&1; then
-          local B64 MOD PREFIX_HEX PRIV_HEX PRIV_LEN
-          B64=$(printf '%s' "$REALITY_PRIVATE" | tr '_-' '/+')
-          MOD=$(( ${#B64} % 4 ))
-          if [ "$MOD" -eq 2 ]; then
-            B64="${B64}=="
-          elif [ "$MOD" -eq 3 ]; then
-            B64="${B64}="
-          elif [ "$MOD" -ne 0 ]; then
-            B64=''
-          fi
-
-          if [ -n "$B64" ] && echo "$B64" | base64 -d > "$TEMP_DIR/_X25519_PRIV_RAW" 2>/dev/null; then
-            PRIV_LEN=$(stat -c%s "$TEMP_DIR/_X25519_PRIV_RAW" 2>/dev/null || stat -f%z "$TEMP_DIR/_X25519_PRIV_RAW")
-            if [ "$PRIV_LEN" -eq 32 ]; then
-              PREFIX_HEX="302e020100300506032b656e04220420"
-              PRIV_HEX=$(xxd -p -c 256 "$TEMP_DIR/_X25519_PRIV_RAW" | tr -d '\n')
-              printf "%s%s" "$PREFIX_HEX" "$PRIV_HEX" | xxd -r -p > "$TEMP_DIR/_X25519_PRIV_DER"
-              if openssl pkcs8 -inform DER -in "$TEMP_DIR/_X25519_PRIV_DER" -nocrypt -out "$TEMP_DIR/_X25519_PRIV_PEM" 2>/dev/null && \
-                 openssl pkey -in "$TEMP_DIR/_X25519_PRIV_PEM" -pubout -outform DER > "$TEMP_DIR/_X25519_PUB_DER" 2>/dev/null; then
-                tail -c 32 "$TEMP_DIR/_X25519_PUB_DER" > "$TEMP_DIR/_X25519_PUB_RAW"
-                REALITY_PUBLIC=$(base64 -w0 "$TEMP_DIR/_X25519_PUB_RAW" | tr '+/' '-_' | sed -E 's/=+$//')
-              fi
-            fi
-          fi
-        fi
-
-        # 方法 1 失败，尝试方法 2：远程 API
-        if [ -z "$REALITY_PUBLIC" ]; then
-          REALITY_PUBLIC=$(wget --no-check-certificate -qO- --tries=3 --timeout=2 \
-            "https://realitykey.cloudflare.now.cc/?privateKey=$REALITY_PRIVATE" \
-            | awk -F '"' '/publicKey/{print $4}')
-        fi
-
+        # 从私钥推导公钥（统一走 derive_reality_public：xray → openssl → 远程 API）
+        REALITY_PUBLIC=$(derive_reality_public "$REALITY_PRIVATE")
         # 都失败，生成随机密钥对
         if [ -z "$REALITY_PUBLIC" ]; then
           warning " $(text 99) "
@@ -1784,8 +1824,9 @@ xray_variable() {
   fi
 
   if [[ " ${INSTALL_PROTOCOLS[*]} " =~ " c " ]]; then
-    # Realm 与端口跳跃互斥：先提示；开启 Realm 后跳过端口跳跃交互
-    hint "\n $(text 182) \n"
+    # Realm 与端口跳跃互斥提示仅在交互安装时显示（快捷/非交互安装跳过，避免打断流水线）
+    ! grep -q 'noninteractive_install' <<< "$NONINTERACTIVE_INSTALL" && [ "$SKIP_MENU" != 'skip_menu' ] && hint "\n $(text 182) \n"
+
     # Hysteria2 Realm 交互（在端口跳跃之前询问，需要先 Realm 再端口跳跃）
     input_hy2_realm
     input_hy2_warp
@@ -2050,6 +2091,11 @@ fetch_nodes_value() {
 
   [ -s "$CUSTOM_FILE" ] && . "$CUSTOM_FILE"
   SERVER_IP="${serverIp:-}"
+  # custom 中 serverIp 缺失/为空时（如 warp/warp-go 全隧穿、首次安装未写入），
+  # 回退到探测的出口 IP，避免节点 server 字段为空导致订阅不可用
+  if [ -z "$SERVER_IP" ] && { [ -n "$WAN4" ] || [ -n "$WAN6" ]; }; then
+    SERVER_IP="${WAN4:-$WAN6}"
+  fi
   REALITY_PRIVATE="${privateKey:-}"
   REALITY_PUBLIC="${publicKey:-}"
   SERVER="${cdn:-}"
@@ -2847,6 +2893,8 @@ input_hy2_realm() {
 
 # 交互输入是否启用 WARP 辅助打洞
 input_hy2_warp() {
+  # 无 TUN 时没有 WARP 出站，WARP 辅助打洞不可用，不询问
+  [ "$IS_TUN" != 'is_tun' ] && return
   # 仅在 Realm 已启用且非交互模式下询问
   [ "$IS_HY2_REALM" != 'is_hy2_realm' ] && return
   # 长参数模式：--HY2_WARP 已传参（无论 true/false），跳过交互
@@ -2895,6 +2943,8 @@ set_hy2_realm_config() {
 # 注意 2：WARP 打洞需要同时添加 warp-IPv4 和 warp-IPv6 两条规则，否则 UDP 打洞可能失败
 sync_hy2_warp_route() {
   local _action="$1"
+  # 无 TUN 时无 warp-IPv4/warp-IPv6 出站，WARP 辅助打洞无可指向，直接跳过，防止写入无效路由
+  [ "$IS_TUN" != 'is_tun' ] && return 0
   # inbound.json 用于获取 hysteria2 的 inboundTag 名称
   local _ib="$WORK_DIR/inbound.json"
   # outbound.json 用于读写 WARP 路由规则
@@ -2952,7 +3002,8 @@ handle_hy2_realm() {
   # 提取受影响的 hysteria2 inbound tag，强制热更新（因增量 diff 只对比 tag，不对比内容）
   _hy2_tag=$(grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq -r '.inbounds[] | select(.tag | endswith("hysteria2")) | .tag // empty' 2>/dev/null)
   api_hot_reload inbounds ${_hy2_tag:+"$_hy2_tag"}
-  api_hot_reload routing_rules
+  # 无 TUN 时无 WARP 路由可同步（sync_hy2_warp_route 已跳过），且 RoutingService 未启用，跳过全量路由同步以免误报 adrules 失败
+  [ "$IS_TUN" = 'is_tun' ] && api_hot_reload routing_rules
   info "\n $(text 128) \n"
   export_list
 }
@@ -3326,35 +3377,34 @@ install_argox() {
   for _p in "${INSTALL_PROTOCOLS[@]}"; do [[ "$_p" =~ ^[bdj]$ ]] && _HAS_REALITY_INSTALL=true && break; done
   if $_HAS_REALITY_INSTALL; then
     if [ -n "$REALITY_PRIVATE" ] && [ -z "$REALITY_PUBLIC" ]; then
-      # 有私钥无公钥（如 config.conf 只填了私钥）→ xray 已就位，从私钥推导公钥
-      REALITY_PUBLIC=$($TEMP_DIR/xray x25519 -i "$REALITY_PRIVATE" | awk '/Public/{print $NF}')
+      # 有私钥无公钥（如 config.conf 只填了私钥）→ 统一推导
+      REALITY_PUBLIC=$(derive_reality_public "$REALITY_PRIVATE")
       if [ -z "$REALITY_PUBLIC" ]; then
         warning " $(text 99) "
-        REALITY_KEYPAIR=$($TEMP_DIR/xray x25519)
-        REALITY_PRIVATE=$(awk '/Private/{print $NF}' <<< "$REALITY_KEYPAIR")
-        REALITY_PUBLIC=$(awk '/Public|Password/{print $NF}' <<< "$REALITY_KEYPAIR")
+        generate_reality_keypair
       fi
     elif [ -z "$REALITY_PRIVATE" ]; then
       # 私钥也为空 → 随机生成一对
-      REALITY_KEYPAIR=$($TEMP_DIR/xray x25519)
-      REALITY_PRIVATE=$(awk '/Private/{print $NF}' <<< "$REALITY_KEYPAIR")
-      REALITY_PUBLIC=$(awk '/Public|Password/{print $NF}' <<< "$REALITY_KEYPAIR")
+      generate_reality_keypair
     fi
   fi
 
   # ChatGPT 解锁检测，决定 OpenAI 路由的 outboundTag（direct / warp-IPv4 / warp-IPv6）
-  if [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    CHATGPT_STACK='-4'
-  elif [[ "$SERVER_IP" =~ ^[0-9a-fA-F:]+$ && "$SERVER_IP" =~ : ]]; then
-    CHATGPT_STACK='-6'
-  else
-    # 域名为 NAT 场景的动态地址，交由 wget 按系统默认栈解析
-    CHATGPT_STACK=''
-  fi
-  if [ "$(check_chatgpt ${CHATGPT_STACK})" = 'unlock' ]; then
-    CHAT_GPT_OUT_V4=direct && CHAT_GPT_OUT_V6=direct
-  else
-    CHAT_GPT_OUT_V4=warp-IPv4 && CHAT_GPT_OUT_V6=warp-IPv6
+  # 仅 TUN 支持（IS_TUN=is_tun）时才有 WARP 出口与 ChatGPT 分流路由；无 TUN 时无需探测
+  if [ "$IS_TUN" = 'is_tun' ]; then
+    if [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      CHATGPT_STACK='-4'
+    elif [[ "$SERVER_IP" =~ ^[0-9a-fA-F:]+$ && "$SERVER_IP" =~ : ]]; then
+      CHATGPT_STACK='-6'
+    else
+      # 域名为 NAT 场景的动态地址，交由 wget 按系统默认栈解析
+      CHATGPT_STACK=''
+    fi
+    if [ "$(check_chatgpt ${CHATGPT_STACK})" = 'unlock' ]; then
+      CHAT_GPT_OUT_V4=direct && CHAT_GPT_OUT_V6=direct
+    else
+      CHAT_GPT_OUT_V4=warp-IPv4 && CHAT_GPT_OUT_V6=warp-IPv6
+    fi
   fi
 
   [ ! -d /etc/systemd/system ] && mkdir -p /etc/systemd/system
@@ -3377,12 +3427,12 @@ install_argox() {
   if [ "$IS_ARGO" = 'is_argo' ]; then
     [[ ! -s $WORK_DIR/cloudflared && -x $TEMP_DIR/cloudflared ]] && mv $TEMP_DIR/cloudflared $WORK_DIR
     if [[ -n "${ARGO_JSON}" && -n "${ARGO_DOMAIN}" ]]; then
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --config $WORK_DIR/tunnel.yml run"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --config $WORK_DIR/tunnel.yml run"
       json_argo
     elif [[ -n "${ARGO_TOKEN}" && -n "${ARGO_DOMAIN}" ]]; then
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto run --token ${ARGO_TOKEN}"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN}"
     else
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --no-autoupdate --url http://localhost:${NGINX_PORT}"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --no-autoupdate --url http://localhost:${NGINX_PORT}"
     fi
 
     if [ "$SYSTEM" = 'Alpine' ]; then
@@ -3490,7 +3540,7 @@ start_pre() {
     chmod 755 ${WORK_DIR}
     rm -f "\$pidfile"
     if [ -s ${WORK_DIR}/nginx.conf ] && command -v /usr/sbin/nginx >/dev/null 2>&1; then
-        pgrep -f "nginx.*${WORK_DIR}/nginx.conf" >/dev/null 2>&1 || /usr/sbin/nginx -c ${WORK_DIR}/nginx.conf
+        ps -eo pid,args | grep -q "[n]ginx.*${WORK_DIR}/nginx.conf" || /usr/sbin/nginx -c ${WORK_DIR}/nginx.conf
     fi
     return 0
 }
@@ -4046,17 +4096,21 @@ JSONEOF
   local _api_port
   _api_port=$(find_free_port 10000 65535)
 
+  local _api_services='[
+        "HandlerService",
+        "LoggerService",
+        "StatsService"'
+  [ "$IS_TUN" = 'is_tun' ] && _api_services+=',
+        "RoutingService"'
+  _api_services+='
+      ]'
+
   cat > $WORK_DIR/inbound.json << EOF
 {
   "api": {
     "tag": "api",
     "listen": "127.0.0.1:${_api_port}",
-    "services": [
-      "HandlerService",
-      "LoggerService",
-      "StatsService",
-      "RoutingService"
-    ]
+    "services": ${_api_services}
   },
   "stats": {},
   "policy": {
@@ -4077,7 +4131,7 @@ ${INBOUNDS_JSON}
   ],
   "dns": {
     "servers": [
-      "https+local://8.8.8.8/dns-query"
+      "localhost"
     ]
   }
 }
@@ -4088,7 +4142,7 @@ EOF
     local WARP_ACCOUNT=$(< "$TEMP_DIR/warp_account.json")
     rm -f "$TEMP_DIR/warp_account.json"
   else
-    local WARP_ACCOUNT=$(wget -qO- --tries=10 --waitretry=1 --timeout=2 "https://warp.cloudflare.nyc.mn/?run=register")
+    local WARP_ACCOUNT=$(timeout 15 bash <(wget -qO- --timeout=5 --tries=1 "https://gitlab.com/fscarmen/warp/-/raw/main/api.sh") --register)
   fi
 
   if grep -q '"id"' <<< "$WARP_ACCOUNT"; then
@@ -4108,6 +4162,82 @@ EOF
     local WARP_R3=76
   fi
 
+  local WARP_OUTBOUND_JSON=""
+  if [ "$IS_TUN" = 'is_tun' ]; then
+    WARP_OUTBOUND_JSON=",
+        {
+            \"protocol\": \"wireguard\",
+            \"tag\": \"wireguard\",
+            \"settings\": {
+                \"secretKey\": \"${WARP_PRIVATE}\",
+                \"address\": [
+                    \"172.16.0.2/32\",
+                    \"${WARP_V6}/128\"
+                ],
+                \"peers\": [
+                    {
+                        \"publicKey\": \"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=\",
+                        \"allowedIPs\": [
+                            \"0.0.0.0/0\",
+                            \"::/0\"
+                        ],
+                        \"endpoint\": \"engage.cloudflareclient.com:2408\"
+                    }
+                ],
+                \"reserved\": [
+                    ${WARP_R1},
+                    ${WARP_R2},
+                    ${WARP_R3}
+                ],
+                \"mtu\": 1280
+            }
+        },
+        {
+            \"protocol\": \"freedom\",
+            \"tag\": \"warp-IPv4\",
+            \"settings\": {},
+            \"streamSettings\": {
+                \"sockopt\": {
+                    \"dialerProxy\": \"wireguard\"
+                }
+            }
+        },
+        {
+            \"protocol\": \"freedom\",
+            \"tag\": \"warp-IPv6\",
+            \"settings\": {},
+            \"streamSettings\": {
+                \"sockopt\": {
+                    \"dialerProxy\": \"wireguard\"
+                }
+            }
+        }"
+  fi
+
+  local ROUTING_JSON=""
+  if [ "$IS_TUN" = 'is_tun' ]; then
+    ROUTING_JSON=",
+    \"routing\": {
+        \"domainStrategy\": \"AsIs\",
+        \"rules\": [
+            {
+                \"type\": \"field\",
+                \"domain\": [
+                    \"api.openai.com\"
+                ],
+                \"outboundTag\": \"${CHAT_GPT_OUT_V4}\"
+            },
+            {
+                \"type\": \"field\",
+                \"domain\": [
+                    \"geosite:openai\"
+                ],
+                \"outboundTag\": \"${CHAT_GPT_OUT_V6}\"
+            }
+        ]
+    }"
+  fi
+
   cat > $WORK_DIR/outbound.json << EOF
 {
     "outbounds": [
@@ -4121,74 +4251,8 @@ EOF
 
             },
             "tag": "block"
-        },
-        {
-            "protocol": "wireguard",
-            "tag": "wireguard",
-            "settings": {
-                "secretKey": "${WARP_PRIVATE}",
-                "address": [
-                    "172.16.0.2/32",
-                    "${WARP_V6}/128"
-                ],
-                "peers": [
-                    {
-                        "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                        "allowedIPs": [
-                            "0.0.0.0/0",
-                            "::/0"
-                        ],
-                        "endpoint": "engage.cloudflareclient.com:2408"
-                    }
-                ],
-                "reserved": [
-                    ${WARP_R1},
-                    ${WARP_R2},
-                    ${WARP_R3}
-                ],
-                "mtu": 1280
-            }
-        },
-        {
-            "protocol": "freedom",
-            "tag": "warp-IPv4",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            },
-            "proxySettings": {
-                "tag": "wireguard"
-            }
-        },
-        {
-            "protocol": "freedom",
-            "tag": "warp-IPv6",
-            "settings": {
-                "domainStrategy": "UseIPv6"
-            },
-            "proxySettings": {
-                "tag": "wireguard"
-            }
-        }
-    ],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [
-            {
-                "type": "field",
-                "domain": [
-                    "api.openai.com"
-                ],
-                "outboundTag": "${CHAT_GPT_OUT_V4}"
-            },
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:openai"
-                ],
-                "outboundTag": "${CHAT_GPT_OUT_V6}"
-            }
-        ]
-    }
+        }${WARP_OUTBOUND_JSON}
+    ]${ROUTING_JSON}
 }
 EOF
 
@@ -4283,6 +4347,31 @@ ensure_stats_data() {
     done
   fi
   [ -z "$STATS_JSON" ] && return 1
+  return 0
+}
+
+# 遍历 STATS_JSON，按两个 name 模式分别累加 value，输出 "SUM1 SUM2"（供汇总/逐协议复用）
+sum_stats() {
+  local _p1="$1" _p2="$2" _s1=0 _s2=0 _line _n _v
+  while IFS= read -r _line; do
+    _n=$(echo "$_line" | $WORK_DIR/jq -r '.name // empty' 2>/dev/null)
+    _v=$(echo "$_line" | $WORK_DIR/jq -r '.value // 0' 2>/dev/null)
+    [ -z "$_n" ] && continue
+    case "$_n" in
+      $_p1 ) _s1=$((_s1 + _v)) ;;
+      $_p2 ) _s2=$((_s2 + _v)) ;;
+    esac
+  done < <(echo "$STATS_JSON" | $WORK_DIR/jq -c '.stat[]' 2>/dev/null)
+  echo "$_s1 $_s2"
+}
+
+# 返回 Xray 总流量统计，输出 "IN_SUM OUT_SUM"（inbound 下行 / outbound 上行），
+# 与 -n 的 Inbound (total) / Outbound (total) 口径一致；API 不可用时输出 "0 0"
+traffic_summary() {
+  local _in_sum _out_sum
+  ensure_stats_data 2>/dev/null || { echo "0 0"; return; }
+  read -r _in_sum _out_sum < <(sum_stats 'inbound*traffic*downlink' 'outbound*traffic*uplink')
+  echo "$_in_sum $_out_sum"
 }
 
 export_list() {
@@ -4292,9 +4381,9 @@ export_list() {
   check_install
 
   local ARGO_MEM='' XRAY_MEM='' NGINX_MEM=''
-  local ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
+  local ARGO_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/cloudflared"){print $1;exit}')
   [ -n "$ARGO_PID" ] && ARGO_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status 2>/dev/null) MB"
-  local XRAY_PID=$(pgrep -f "$WORK_DIR/xray")
+  local XRAY_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/xray"){print $1;exit}')
   [ -n "$XRAY_PID" ] && XRAY_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${XRAY_PID%% *}/status 2>/dev/null) MB"
   if [ -s $WORK_DIR/nginx.conf ]; then
     local NGINX_PID=$(nginx_pid)
@@ -4311,9 +4400,9 @@ export_list() {
       [ "${STATUS[1]}" != "$(text 28)" ] && cmd_systemctl enable xray
       sleep 2
       check_install
-      [ "$IS_ARGO" = 'is_argo' ] && ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
+      [ "$IS_ARGO" = 'is_argo' ] && ARGO_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/cloudflared"){print $1;exit}')
       [ -n "$ARGO_PID" ] && ARGO_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status) MB"
-      XRAY_PID=$(pgrep -f "$WORK_DIR/xray")
+      XRAY_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/xray"){print $1;exit}')
       [ -n "$XRAY_PID" ] && XRAY_MEM="$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${XRAY_PID%% *}/status) MB"
     else
       exit
@@ -4500,7 +4589,12 @@ export_list() {
   # 写入订阅文件（仅 IS_SUB=is_sub 且有协议时生成；0 协议跳过，避免生成空订阅覆盖现有文件）
   if [ "$IS_SUB" = 'is_sub' ] && [ -n "$PROTOS_NOW" ]; then
     echo -e "$CLASH" > $WORK_DIR/subscribe/proxies
-    wget --no-check-certificate -qO- --tries=3 --timeout=2 ${SUBSCRIBE_TEMPLATE}/clash | sed "s#NODE_NAME#${NODE_NAME}#g; s#PROXY_PROVIDERS_URL#${_SUB_SCHEME}://${_SUB_DOMAIN}/${UUID}/proxies#" > $WORK_DIR/subscribe/clash
+    # 优先用 check_dependencies 已后台缓存的模板，离线/缓存失效时再回退在线拉取
+    if [ -s "$TEMP_DIR/clash" ]; then
+      sed "s#NODE_NAME#${NODE_NAME}#g; s#PROXY_PROVIDERS_URL#${_SUB_SCHEME}://${_SUB_DOMAIN}/${UUID}/proxies#" "$TEMP_DIR/clash" > $WORK_DIR/subscribe/clash
+    else
+      wget --no-check-certificate -qO- --tries=3 --timeout=2 ${SUBSCRIBE_TEMPLATE}/clash | sed "s#NODE_NAME#${NODE_NAME}#g; s#PROXY_PROVIDERS_URL#${_SUB_SCHEME}://${_SUB_DOMAIN}/${UUID}/proxies#" > $WORK_DIR/subscribe/clash
+    fi
     echo -n "$SHADOWROCKET_SUBSCRIBE" | sed -E '/^[ ]*#|^--/d' | sed '/^$/d' | base64 -w0 > $WORK_DIR/subscribe/shadowrocket
     echo -n "$V2RAYN_SUBSCRIBE" | sed -E '/^[ ]*#|^--/d' | sed '/^$/d' | base64 -w0 > $WORK_DIR/subscribe/v2rayn
     echo -n "$THRONE_SUBSCRIBE" | sed -E '/^[ ]*#|^--/d' | sed '/^$/d' | base64 -w0 > $WORK_DIR/subscribe/throne
@@ -4510,7 +4604,13 @@ export_list() {
   local SINGBOX_DISPLAY='' SINGBOX_BLOCK='' SINGBOX_LINK_BLOCK=''
   if ! grep -Eq '^[[:space:]]*(xhttp-h1\.1-cdn|xhttp-h2-reality|xhttp-h3-direct)[[:space:]]*$' <<< "$PROTOS_NOW" || grep -Eq '(^|[[:space:]])(reality-vision|hysteria2|reality-grpc|vless-ws|vmess-ws|trojan-ws|ss-ws|trojan-direct|ss2022-direct)([[:space:]]|$)' <<< "$PROTOS_NOW"; then
     if [ -n "$SINGBOX_OUTBOUNDS" ]; then
-    local SING_BOX_JSON=$(wget --no-check-certificate -qO- --tries=3 --timeout=2 ${SUBSCRIBE_TEMPLATE}/sing-box)
+    # 优先用 check_dependencies 已后台缓存的模板，离线/缓存失效时再回退在线拉取
+    local SING_BOX_JSON=''
+    if [ -s "$TEMP_DIR/sing-box" ]; then
+      SING_BOX_JSON=$(<"$TEMP_DIR/sing-box")
+    else
+      SING_BOX_JSON=$(wget --no-check-certificate -qO- --tries=3 --timeout=2 ${SUBSCRIBE_TEMPLATE}/sing-box)
+    fi
     echo "$SING_BOX_JSON" | sed "s#\"<OUTBOUND_REPLACE>\"#${SINGBOX_OUTBOUNDS}#; s#\"<NODE_REPLACE>\"#${SINGBOX_TAGS}#g" | $WORK_DIR/jq > $WORK_DIR/subscribe/sing-box
     SINGBOX_DISPLAY=$(echo "{ \"outbounds\":[ ${SINGBOX_OUTBOUNDS} ] }" | $WORK_DIR/jq 2>/dev/null)
     SINGBOX_BLOCK="*******************************************
@@ -4537,8 +4637,8 @@ ${_SUB_SCHEME}://${_SUB_DOMAIN}/${UUID}/sing-box"
   local CLASH_DISPLAY=$(echo -e "$CLASH" | sed '1d')
 
   check_system_info
-  local ARGO_V=$([ -s "$WORK_DIR/cloudflared" ] && $WORK_DIR/cloudflared -v 2>/dev/null | awk '{print $3}')
-  local XRAY_V=$($WORK_DIR/xray version | awk 'NR==1 {print $2}')
+  local ARGO_V=$([ -s "$WORK_DIR/cloudflared" ] && $WORK_DIR/cloudflared -v 2>/dev/null | awk '{for (i=1; i<NF; i++) if ($i=="version") {print $(i+1); exit}}')
+  local XRAY_V=$($WORK_DIR/xray version | awk '{for (i=1; i<NF; i++) if ($i=="Xray") {print $(i+1); exit}}')
   local NGINX_V=$(nginx -v 2>&1 | sed "s#.*/##")
   local SYS_INFO=" $(text 19):\n\t $(text 20): $SYS\n\t $(text 21): $(uname -r)\n\t $(text 22): $ARGO_ARCH\n\t $(text 23): $VIRT\n\t IPv4: $WAN4 $COUNTRY4 $ASNORG4\n\t IPv6: $WAN6 $COUNTRY6 $ASNORG6\n\t Argo: ${STATUS[0]}\t Version: ${ARGO_V}\t $(text 52): ${ARGO_MEM}\n\t Xray: ${STATUS[1]}\t Version: ${XRAY_V}\t $(text 52): ${XRAY_MEM}"
   [ -s $WORK_DIR/nginx.conf ] && SYS_INFO+="\n\t Nginx: ${STATUS[2]}\t Version: ${NGINX_V}\t $(text 52): ${NGINX_MEM}"
@@ -4634,18 +4734,10 @@ $([ -s "$WORK_DIR/qrencode" ] && $WORK_DIR/qrencode ${_SUB_SCHEME}://${_SUB_DOMA
 
   EXPORT_LIST_FILE="${EXPORT_LIST_FILE}${SUB_URL_BLOCK}"
 
-  # === 流量统计块（仅 API 可用时显示；流量为 0 时显示 0 B） ===
-  if ensure_stats_data; then
-    local _in_sum=0 _out_sum=0 _line _name _val
-    while IFS= read -r _line; do
-      _name=$(echo "$_line" | $WORK_DIR/jq -r '.name // empty' 2>/dev/null)
-      _val=$(echo "$_line" | $WORK_DIR/jq -r '.value // 0' 2>/dev/null)
-      [ -z "$_name" ] && continue
-      case "$_name" in
-        inbound*traffic*downlink ) _in_sum=$((_in_sum + _val)) ;;
-        outbound*traffic*uplink )  _out_sum=$((_out_sum + _val)) ;;
-      esac
-    done < <(echo "$STATS_JSON" | $WORK_DIR/jq -c '.stat[]' 2>/dev/null)
+  # === 流量统计块（与主菜单同一口径：inbound 下行 / outbound 上行；仅 Xray 运行时显示） ===
+  if [ "${STATUS[1]}" = "$(text 28)" ]; then
+    local _in_sum _out_sum
+    read -r _in_sum _out_sum < <(traffic_summary)
     EXPORT_LIST_FILE="${EXPORT_LIST_FILE}
 
 *******************************************
@@ -4683,24 +4775,16 @@ change_protocols() {
   # 可用时始终显示（流量为 0 时显示 0 B）
   _proto_traffic_str() {
     [ -z "$STATS_JSON" ] && { echo ''; return; }
-    local _p="$1" _ts='' _dl=0 _ul=0 _line _n _v _idx
+    local _p="$1" _ts='' _dl=0 _ul=0 _idx
     for _idx in "${!NODE_TAG[@]}"; do
       local _pn="${PROTOCOL_LIST[$_idx]}"
       [ "$_idx" = '7' ] && _pn=$(text 101)
       [ "$_p" = "$_pn" ] && { _ts="${NODE_TAG[$_idx]}"; break; }
     done
     if [ -n "$_ts" ]; then
-      while IFS= read -r _line; do
-        _n=$(echo "$_line" | $WORK_DIR/jq -r '.name // empty' 2>/dev/null)
-        _v=$(echo "$_line" | $WORK_DIR/jq -r '.value // 0' 2>/dev/null)
-        [ -z "$_n" ] && continue
-        # stats 名称格式：inbound>>>{节点名 后缀}>>>traffic>>>{downlink|uplink}，
-        # 后缀前是空格（完整 tag 是 "节点名 后缀"），因此模式为 " ${_ts}>>>"
-        case "$_n" in
-          *" ${_ts}>>>traffic>>>downlink" ) _dl=$((_dl + _v)) ;;
-          *" ${_ts}>>>traffic>>>uplink" )   _ul=$((_ul + _v)) ;;
-        esac
-      done < <(echo "$STATS_JSON" | $WORK_DIR/jq -c '.stat[]' 2>/dev/null)
+      # stats 名称格式：inbound>>>{节点名 后缀}>>>traffic>>>{downlink|uplink}，
+      # 后缀前是空格（完整 tag 是 "节点名 后缀"），因此模式为 " ${_ts}>>>"
+      read -r _dl _ul < <(sum_stats "* ${_ts}>>>traffic>>>downlink" "* ${_ts}>>>traffic>>>uplink")
     fi
     echo "  ⬇$(format_traffic $_dl) ⬆$(format_traffic $_ul)"
   }
@@ -4842,7 +4926,7 @@ change_protocols() {
       if [ -z "$REALITY_PRIVATE" ]; then
         generate_reality_keypair
       else
-        REALITY_PUBLIC=$($WORK_DIR/xray x25519 -i "$REALITY_PRIVATE" | awk '/Public/{print $NF}')
+        REALITY_PUBLIC=$(derive_reality_public "$REALITY_PRIVATE")
         if [ -z "$REALITY_PUBLIC" ]; then
           warning " $(text 99) "
           generate_reality_keypair
@@ -5073,17 +5157,21 @@ change_protocols() {
   _api_port=$(grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq -r '.api.listen // empty' 2>/dev/null | awk -F: '{print $2}')
   [ -z "$_api_port" ] && _api_port=$(find_free_port 10000 65535)
 
+  local _api_services='[
+        "HandlerService",
+        "LoggerService",
+        "StatsService"'
+  [ "$IS_TUN" = 'is_tun' ] && _api_services+=',
+        "RoutingService"'
+  _api_services+='
+      ]'
+
   cat > $WORK_DIR/inbound.json << EOF
 {
   "api": {
     "tag": "api",
     "listen": "127.0.0.1:${_api_port}",
-    "services": [
-      "HandlerService",
-      "LoggerService",
-      "StatsService",
-      "RoutingService"
-    ]
+    "services": ${_api_services}
   },
   "stats": {},
   "policy": {
@@ -5102,7 +5190,7 @@ change_protocols() {
   "inbounds": [],
   "dns": {
     "servers": [
-      "https+local://8.8.8.8/dns-query"
+      "localhost"
     ]
   }
 }
@@ -5181,12 +5269,12 @@ EOF
 
     # 构造 ARGO_RUNS 命令
     if [[ -n "${ARGO_JSON}" && -n "${ARGO_DOMAIN}" ]]; then
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --config $WORK_DIR/tunnel.yml run"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --config $WORK_DIR/tunnel.yml run"
       json_argo
     elif [[ -n "${ARGO_TOKEN}" && -n "${ARGO_DOMAIN}" ]]; then
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto run --token ${ARGO_TOKEN}"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN}"
     else
-      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --no-autoupdate --url http://localhost:${NGINX_PORT}"
+      ARGO_RUNS="$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --no-autoupdate --url http://localhost:${NGINX_PORT}"
     fi
 
     # 创建守护进程文件：统一走 write_argo_daemon，避免 Alpine/systemd 双份手写模板
@@ -5266,10 +5354,10 @@ change_argo() {
       cmd_systemctl disable argo
       [ -s $WORK_DIR/tunnel.json ] && rm -f $WORK_DIR/tunnel.{json,yml}
       if [ "$SYSTEM" = 'Alpine' ]; then
-        local ARGS="--edge-ip-version auto --no-autoupdate --url http://localhost:${NGINX_PORT}"
+        local ARGS="--edge-ip-version auto --protocol http2 --no-autoupdate --url http://localhost:${NGINX_PORT}"
         sed -i "s@^command_args=.*@command_args=\"$ARGS\"@g" ${ARGO_DAEMON_FILE}
       else
-        sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --no-autoupdate --url http://localhost:${NGINX_PORT}@g" ${ARGO_DAEMON_FILE}
+        sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --no-autoupdate --url http://localhost:${NGINX_PORT}@g" ${ARGO_DAEMON_FILE}
       fi
       ;;
     2 )
@@ -5285,19 +5373,19 @@ change_argo() {
       if [ -n "$ARGO_TOKEN" ]; then
         [ -s $WORK_DIR/tunnel.json ] && rm -f $WORK_DIR/tunnel.{json,yml}
         if [ "$SYSTEM" = 'Alpine' ]; then
-          local ARGS="--edge-ip-version auto run --token ${ARGO_TOKEN}"
+          local ARGS="--edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN}"
           sed -i "s@^command_args=.*@command_args=\"$ARGS\"@g" ${ARGO_DAEMON_FILE}
         else
-          sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto run --token ${ARGO_TOKEN}@g" ${ARGO_DAEMON_FILE}
+          sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN}@g" ${ARGO_DAEMON_FILE}
         fi
       elif [ -n "$ARGO_JSON" ]; then
         [ -s $WORK_DIR/tunnel.json ] && rm -f $WORK_DIR/tunnel.{json,yml}
         json_argo
         if [ "$SYSTEM" = 'Alpine' ]; then
-          local ARGS="--edge-ip-version auto --config $WORK_DIR/tunnel.yml run"
+          local ARGS="--edge-ip-version auto --protocol http2 --config $WORK_DIR/tunnel.yml run"
           sed -i "s@^command_args=.*@command_args=\"$ARGS\"@g" ${ARGO_DAEMON_FILE}
         else
-          sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --config $WORK_DIR/tunnel.yml run@g" ${ARGO_DAEMON_FILE}
+          sed -i "s@ExecStart=.*@ExecStart=$WORK_DIR/cloudflared tunnel --edge-ip-version auto --protocol http2 --config $WORK_DIR/tunnel.yml run@g" ${ARGO_DAEMON_FILE}
         fi
       fi
       ;;
@@ -5829,7 +5917,7 @@ change_warp_account() {
 # 方式1：重新注册免费账户
 change_warp_account_register() {
   local WARP_ACCOUNT PRIVATE_KEY ADDRESS6 R1 R2 R3
-  WARP_ACCOUNT=$(wget -qO- --tries=10 --waitretry=1 --timeout=2 "https://warp.cloudflare.nyc.mn/?run=register")
+  WARP_ACCOUNT=$(timeout 15 bash <(wget -qO- --timeout=5 --tries=1 "https://gitlab.com/fscarmen/warp/-/raw/main/api.sh") --register)
 
   if ! grep -q '"id"' <<< "$WARP_ACCOUNT"; then
     warning "\n $(text 172) \n"
@@ -5967,9 +6055,11 @@ change_config() {
   # 指定网络出口（始终显示，默认空 = 不指定）
   MENU_IDX+=(75) && MENU_KEY+=(bindinterface) && MENU_VAL+=("${BIND_IFACE:-default}")
 
-  # 自定义 warp 出站路由规则（使用 custom_route_count 统计）
-  CUSTOM_ROUTE_COUNT=$(custom_route_count 2>/dev/null || echo 0)
-  MENU_IDX+=(131) && MENU_KEY+=(customroute) && MENU_VAL+=("${CUSTOM_ROUTE_COUNT}")
+  # 自定义 warp 出站路由规则（无 TUN 时无 WARP 出站，隐藏该入口）
+  if [ "$IS_TUN" = 'is_tun' ]; then
+    CUSTOM_ROUTE_COUNT=$(custom_route_count 2>/dev/null || echo 0)
+    MENU_IDX+=(131) && MENU_KEY+=(customroute) && MENU_VAL+=("${CUSTOM_ROUTE_COUNT}")
+  fi
 
   # 更换 WARP 账户（仅当 outbound.json 中存在 wireguard 出站时显示）
   grep -q '"wireguard"' ${WORK_DIR}/outbound.json 2>/dev/null && {
@@ -6041,7 +6131,8 @@ change_config() {
       sync_hy2_warp_route disable
       local _HY2_TAG=$(grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq -r '.inbounds[] | select(.tag | endswith("hysteria2")) | .tag // empty' 2>/dev/null)
       api_hot_reload inbounds ${_HY2_TAG:+"$_HY2_TAG"}
-      api_hot_reload routing_rules
+      # 无 TUN 时无 WARP 路由可同步且 RoutingService 未启用，跳过全量路由同步以免误报 adrules 失败
+      [ "$IS_TUN" = 'is_tun' ] && api_hot_reload routing_rules
     fi
     input_hopping_port
     # 保存用户输入的起止端口，后续删除旧规则时内部检测可能会清空
@@ -6448,19 +6539,19 @@ uninstall() {
 version() {
   local ONLINE=$(wget --no-check-certificate -qO- "${GH_PROXY}https://api.github.com/repos/cloudflare/cloudflared/releases/latest" | grep "tag_name" | cut -d \" -f4)
   [ -z "$ONLINE" ] && error " $(text 74) "
-  local LOCAL=$($WORK_DIR/cloudflared -v | awk '{for (i=0; i<NF; i++) if ($i=="version") {print $(i+1)}}')
+  local LOCAL=$($WORK_DIR/cloudflared -v | awk '{for (i=1; i<NF; i++) if ($i=="version") {print $(i+1); exit}}')
   local APP=ARGO && info "\n $(text 43) "
   [[ -n "$ONLINE" && "$ONLINE" != "$LOCAL" ]] && reading "\n $(text 9) " UPDATE[0] || info " $(text 44) "
 
   ONLINE=$(wget --no-check-certificate -qO- "${GH_PROXY}https://api.github.com/repos/XTLS/Xray-core/releases" | awk -F '["v]' '/tag_name/{print $5}' | sort -rV | sed -n 1p)
   [ -z "$ONLINE" ] && error " $(text 74) "
-  LOCAL=$($WORK_DIR/xray version | awk '{for (i=0; i<NF; i++) if ($i=="Xray") {print $(i+1)}}')
+  LOCAL=$($WORK_DIR/xray version | awk '{for (i=1; i<NF; i++) if ($i=="Xray") {print $(i+1); exit}}')
   local APP=Xray && info "\n $(text 43) "
   [[ -n "$ONLINE" && "$ONLINE" != "$LOCAL" ]] && reading "\n $(text 9) " UPDATE[1] || info " $(text 44) "
 
   [[ "${UPDATE[*],,}" =~ y ]] && check_system_info
   if [ "${UPDATE[0],,}" = 'y' ]; then
-    wget --no-check-certificate -O $TEMP_DIR/cloudflared ${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH
+    wget --no-check-certificate -O $TEMP_DIR/cloudflared ${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH 2>/dev/null
     if [ -s $TEMP_DIR/cloudflared ]; then
       cmd_systemctl disable argo
       chmod +x $TEMP_DIR/cloudflared && mv $TEMP_DIR/cloudflared $WORK_DIR/cloudflared
@@ -6471,10 +6562,21 @@ version() {
     fi
   fi
   if [ "${UPDATE[1],,}" = 'y' ]; then
-    wget --no-check-certificate -O $TEMP_DIR/Xray-linux-$XRAY_ARCH.zip ${GH_PROXY}https://github.com/XTLS/Xray-core/releases/download/v${ONLINE}/Xray-linux-$XRAY_ARCH.zip
-    if [ -s $TEMP_DIR/Xray-linux-$XRAY_ARCH.zip ]; then
+    # 直接使用文件路径，仅保留 URL 切换变量、循环计数变量。
+    # 先下载到临时 zip 并校验可解压，避免中断导致损坏的压缩包直接喂给 unzip 报错；失败自动重试（第2次起去掉代理直连）
+    local XRAY_ZIP_URL XRAY_TRY
+    for XRAY_TRY in 1 2 3; do
+      rm -f "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip"
+      XRAY_ZIP_URL="${GH_PROXY}https://github.com/XTLS/Xray-core/releases/download/v${ONLINE}/Xray-linux-$XRAY_ARCH.zip"
+      [ "$XRAY_TRY" -ge 2 ] && XRAY_ZIP_URL="https://github.com/XTLS/Xray-core/releases/download/v${ONLINE}/Xray-linux-$XRAY_ARCH.zip"
+      wget --no-check-certificate -qO "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip" "$XRAY_ZIP_URL" 2>/dev/null || { sleep 3; continue; }
+      [ -s "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip" ] || { sleep 3; continue; }
+      # unzip -t 完整解压校验：损坏/中断的 zip 会在这里被拦截；校验通过即结束重试
+      unzip -tq "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip" >/dev/null 2>&1 && break || { rm -f "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip"; sleep 3; }
+    done
+    if [ -s "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip" ]; then
       cmd_systemctl disable xray
-      unzip -qo $TEMP_DIR/Xray-linux-$XRAY_ARCH.zip xray *.dat -d $WORK_DIR; rm -f $TEMP_DIR/Xray*.zip
+      unzip -qo "$TEMP_DIR/Xray-linux-$XRAY_ARCH.zip" xray *.dat -d $WORK_DIR >/dev/null 2>&1; rm -f $TEMP_DIR/Xray*.zip
       cmd_systemctl enable xray
       cmd_systemctl status xray &>/dev/null && info " Xray $(text 28) $(text 37)" || error " Xray $(text 28) $(text 38) "
     else
@@ -6490,12 +6592,12 @@ menu_setting() {
   ARGO_VERSION='' XRAY_VERSION='' NGINX_VERSION='' ARGO_CHECKHEALTH='' ARGO_MEMORY='' XRAY_MEMORY='' NGINX_MEMORY=''
   if [[ "${STATUS[*]}" =~ $(text 27)|$(text 28) ]]; then
     if [ -s $WORK_DIR/cloudflared ]; then
-      ARGO_VERSION=$($WORK_DIR/cloudflared -v | awk '{print $3}' | sed "s@^@Version: &@g")
+      ARGO_VERSION=$($WORK_DIR/cloudflared -v | awk '{for (i=1; i<NF; i++) if ($i=="version") {print $(i+1); exit}}' | sed "s@^@Version: &@g")
       local ARGO_PID=$(awk '/cloudflared/{print $1}' <<< "$PS_LIST")
-      local REALTIME_METRICS_PORT=$(ss -nltp | awk -v pid=${ARGO_PID} '$0 ~ "pid="pid"," {split($4, a, ":"); print a[length(a)]}')
+      local REALTIME_METRICS_PORT=$(ss -nltp | awk -v pid=${ARGO_PID} '$0 ~ "pid="pid"," {n=split($4, a, ":"); print a[n]}')
       ss -nltp | grep -q "cloudflared.*pid=${ARGO_PID}," && ARGO_CHECKHEALTH="$(text 46): $(wget -qO- http://localhost:${REALTIME_METRICS_PORT}/healthcheck | sed "s/OK/$(text 37)/")"
     fi
-    [ -s $WORK_DIR/xray ] && XRAY_VERSION=$($WORK_DIR/xray version | awk 'NR==1 {print $2}' | sed "s@^@Version: &@g")
+    [ -s $WORK_DIR/xray ] && XRAY_VERSION=$($WORK_DIR/xray version | awk '{for (i=1; i<NF; i++) if ($i=="Xray") {print $(i+1); exit}}' | sed "s@^@Version: &@g")
     [ -s $WORK_DIR/nginx.conf ] && NGINX_VERSION=$(nginx -v 2>&1 | sed "s#.*/##; s/ (.*)//" | sed "s@^@Version: &@g")
 
     local _opt=1
@@ -6506,7 +6608,7 @@ menu_setting() {
     # Argo 选项：仅当 Argo 守护进程文件存在时才显示
     if [ -s "${ARGO_DAEMON_FILE}" ]; then
       if [ "${STATUS[0]}" = "$(text 28)" ]; then
-        local ARGO_PID=$(pgrep -f "$WORK_DIR/cloudflared")
+        local ARGO_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/cloudflared"){print $1;exit}')
         [ -n "$ARGO_PID" ] && ARGO_MEMORY="$(text 52): $(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${ARGO_PID%% *}/status 2>/dev/null) MB"
         OPTION[_opt]="$(printf '%3d.' $_opt) $(text 27) Argo (argox -a)"
       else
@@ -6531,7 +6633,7 @@ menu_setting() {
       [ -n "$NGINX_PID" ] && NGINX_MEMORY="$(text 52): $(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${NGINX_PID%% *}/status 2>/dev/null) MB"
     fi
     if [ "${STATUS[1]}" = "$(text 28)" ]; then
-      local XRAY_PID=$(pgrep -f "$WORK_DIR/xray")
+      local XRAY_PID=$(ps -eo pid,args | awk -v d="$WORK_DIR" '$0~(d"/xray"){print $1;exit}')
       [ -n "$XRAY_PID" ] && XRAY_MEMORY="$(text 52): $(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/${XRAY_PID%% *}/status 2>/dev/null) MB"
       OPTION[_opt]="$(printf '%3d.' $_opt) $(text 27) Xray (argox -x)"
     else
@@ -6623,20 +6725,14 @@ menu() {
   local _XV; printf -v _XV '%-26s' "$XRAY_VERSION"
   local _NV; printf -v _NV '%-26s' "$NGINX_VERSION"
   info "\t Argo:  $(_sv "${STATUS[0]}")  ${_AV}${ARGO_MEMORY}\t ${ARGO_CHECKHEALTH}"
+  # === 计算 Xray 行流量（与 -n 同一口径：inbound 下行 / outbound 上行，复用 traffic_summary）；仅 Xray 运行时显示 ===
   local _xray_traffic=""
-  if ensure_stats_data 2>/dev/null; then
-    local _in_sum=0 _out_sum=0 _line _name _val
-    while IFS= read -r _line; do
-      _name=$(echo "$_line" | $WORK_DIR/jq -r '.name // empty' 2>/dev/null)
-      _val=$(echo "$_line" | $WORK_DIR/jq -r '.value // 0' 2>/dev/null)
-      [ -z "$_name" ] && continue
-      case "$_name" in
-        inbound*traffic*downlink ) _in_sum=$((_in_sum + _val)) ;;
-        outbound*traffic*uplink )  _out_sum=$((_out_sum + _val)) ;;
-      esac
-    done < <(echo "$STATS_JSON" | $WORK_DIR/jq -c '.stat[]' 2>/dev/null)
+  if [ "${STATUS[1]}" = "$(text 28)" ]; then
+    local _in_sum _out_sum
+    read -r _in_sum _out_sum < <(traffic_summary)
     _xray_traffic="  ⬇$(format_traffic $_in_sum) ⬆$(format_traffic $_out_sum)"
   fi
+  # === 结束 ===
   info "\t Xray:  $(_sv "${STATUS[1]}")  ${_XV}${XRAY_MEMORY}${_xray_traffic}"
   [ -s $WORK_DIR/nginx.conf ] && info "\t Nginx: $(_sv "${STATUS[2]}")  ${_NV}${NGINX_MEMORY}"
   echo -e "\n======================================================================================================================\n"
@@ -6694,10 +6790,15 @@ if [ -x "$WORK_DIR/jq" ] && [ -s "$WORK_DIR/inbound.json" ] && [[ "$(date +%Y%m%
       _api_port=$(find_free_port 10000 65535)
     fi
     _api_listen="127.0.0.1:${_api_port}"
-    grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq --arg listen "$_api_listen" '
+    # 迁移期补全 api 块时按 TUN 能力决定是否启用 RoutingService（与 outbound 生成逻辑一致）
+    if [ -c /dev/net/tun ] || cat /dev/net/tun 2>&1 | grep -q "in bad state\|处于错误状态"; then
+      _mig_api_services='["HandlerService", "LoggerService", "StatsService", "RoutingService"]'
+    else
+      _mig_api_services='["HandlerService", "LoggerService", "StatsService"]'
+    fi
+    grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq --arg listen "$_api_listen" --argjson services "$_mig_api_services" '
       .api = (if has("api") then .api
-              else { "tag": "api", "listen": $listen,
-                     "services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"] }
+              else { "tag": "api", "listen": $listen, "services": $services }
               end) |
       .stats = (.stats // {}) |
       .policy = ((.policy // {}) + {
@@ -6721,6 +6822,68 @@ if [ -x "$WORK_DIR/jq" ] && [ -s "$WORK_DIR/inbound.json" ] && [[ "$(date +%Y%m%
       fi
     }
   }
+fi
+
+###### 旧版 WARP 链式出站迁移：Xray ≥26.9 已移除 outbound.proxySettings，改为 streamSettings.sockopt.dialerProxy,将于 2026年12月31日移除
+###### 将 warp-IPv4 / warp-IPv6 的 proxySettings 改写为 dialerProxy，并用 Xray API 热加载（失败则后台重启兑底）
+###### 此迁移发生时新 Xray 未能启动的概率高，因此必须用 API 热加载以免 SSH 断开，同时保留后台重启兑底
+if [ -x "$WORK_DIR/jq" ] && [ -s "$WORK_DIR/outbound.json" ] && [[ "$(date +%Y%m%d)" < "20270101" ]]; then
+  # 存在旧字段且缺 dialerProxy 才处理（幂等，burst 检测避免重复热载）
+  if grep -v '^//' "$WORK_DIR/outbound.json" | $WORK_DIR/jq -e \
+    'any(.outbounds[]? | select(.tag == "warp-IPv4" or .tag == "warp-IPv6"); has("proxySettings")) and
+     any(.outbounds[]? | select(.tag == "warp-IPv4" or .tag == "warp-IPv6"); (.streamSettings.sockopt.dialerProxy) != null) | not' \
+    >/dev/null 2>&1; then
+
+    # 1) 用 jq 一次性重写：删 proxySettings，补齐 streamSettings.sockopt.dialerProxy，settings 置空
+    grep -v '^//' "$WORK_DIR/outbound.json" | $WORK_DIR/jq '
+      .outbounds |= map(
+        if (.tag == "warp-IPv4" or .tag == "warp-IPv6") then
+          del(.proxySettings)
+          | .settings = {}
+          | .streamSettings.sockopt.dialerProxy = "wireguard"
+          | del(.streamSettings.sockopt.domainStrategy)   # dialerProxy 下 Freedom 不解析域名，移除无效字段
+        else . end
+      )
+    ' > "$TEMP_DIR/outbound_warp_mig.json" 2>/dev/null \
+      && mv "$TEMP_DIR/outbound_warp_mig.json" "$WORK_DIR/outbound.json" || true
+
+    # 2) 校验新配置可用（失败不打热加载，避免把坏配置注入运行中的实例）
+    _warp_cfg_ok=false
+    if [ -x "$WORK_DIR/xray" ] && [ -s "$WORK_DIR/inbound.json" ]; then
+      if $WORK_DIR/xray run -test -c "$WORK_DIR/inbound.json" -c "$WORK_DIR/outbound.json" >"$TEMP_DIR/xray_warp_test.err" 2>&1; then
+        _warp_cfg_ok=true
+      fi
+    fi
+
+    # 3) 配置有效则热加载；API 方案优先，失败才后台重启（后台重启是为避免 SSH 断开时命令中断）
+    if [ "$_warp_cfg_ok" = 'true' ]; then
+      _warp_loaded=false
+      if [ -x "$WORK_DIR/xray" ]; then
+        _warp_api_port=$(grep -v '^//' "$WORK_DIR/inbound.json" | $WORK_DIR/jq -r '.api.listen // empty' 2>/dev/null | awk -F: '{print $2}')
+        if [ -n "$_warp_api_port" ] && $WORK_DIR/xray api lsi --server="127.0.0.1:${_warp_api_port}" --isOnlyTags=true &>/dev/null; then
+          # 逐个强制热更两个出站（rmo + ado，key 变更相关字段必须 force）
+          for _warp_tag in warp-IPv4 warp-IPv6; do
+            if ( cd / ; $WORK_DIR/xray api rmo --server="127.0.0.1:${_warp_api_port}" "$_warp_tag" &>/dev/null ); then :; fi
+            grep -v '^//' "$WORK_DIR/outbound.json" \
+              | $WORK_DIR/jq -c "{outbounds: [.outbounds[] | select(.tag == \"$_warp_tag\")]}" \
+              > "$TEMP_DIR/warp_${_warp_tag}.json" 2>/dev/null \
+              && $WORK_DIR/xray api ado --server="127.0.0.1:${_warp_api_port}" "$TEMP_DIR/warp_${_warp_tag}.json" &>/dev/null \
+              && _warp_loaded=true
+            rm -f "$TEMP_DIR/warp_${_warp_tag}.json"
+          done
+        fi
+      fi
+      # API 热加载未完成则后台重启兑底（不动到 SSH：nohup 后台、微秒内返回）
+      if [ "$_warp_loaded" != 'true' ]; then
+        if [ -d /run/openrc ] || command -v rc-service >/dev/null 2>&1; then
+          ( nohup rc-service xray restart >/dev/null 2>&1 & )
+        else
+          ( nohup systemctl restart xray >/dev/null 2>&1 & )
+        fi
+      fi
+    fi
+    unset _warp_cfg_ok _warp_loaded _warp_api_port _warp_tag
+  fi
 fi
 
 # ── 传参处理1: 语言识别 + SKIP_MENU 检测（在 select_language 之前） ──
